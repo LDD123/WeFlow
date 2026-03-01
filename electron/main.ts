@@ -986,6 +986,14 @@ function registerIpcHandlers() {
     return chatService.getSessionDetail(sessionId)
   })
 
+  ipcMain.handle('chat:getSessionDetailFast', async (_, sessionId: string) => {
+    return chatService.getSessionDetailFast(sessionId)
+  })
+
+  ipcMain.handle('chat:getSessionDetailExtra', async (_, sessionId: string) => {
+    return chatService.getSessionDetailExtra(sessionId)
+  })
+
   ipcMain.handle('chat:getExportSessionStats', async (_, sessionIds: string[]) => {
     return chatService.getExportSessionStats(sessionIds)
   })

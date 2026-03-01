@@ -159,6 +159,24 @@ interface ExportTabCounts {
   former_friend: number
 }
 
+interface SessionDetailFast {
+  wxid: string
+  displayName: string
+  remark?: string
+  nickName?: string
+  alias?: string
+  avatarUrl?: string
+  messageCount: number
+}
+
+interface SessionDetailExtra {
+  firstMessageTime?: number
+  latestMessageTime?: number
+  messageTables: { dbName: string; tableName: string; count: number }[]
+}
+
+type SessionDetail = SessionDetailFast & SessionDetailExtra
+
 // 表情包缓存
 const emojiCache: Map<string, string> = new Map()
 const emojiDownloading: Map<string, Promise<string | null>> = new Map()
@@ -201,6 +219,10 @@ class ChatService {
   private sessionMessageCountHintCache = new Map<string, number>()
   private sessionMessageCountCacheScope = ''
   private readonly sessionMessageCountCacheTtlMs = 10 * 60 * 1000
+  private sessionDetailFastCache = new Map<string, { detail: SessionDetailFast; updatedAt: number }>()
+  private sessionDetailExtraCache = new Map<string, { detail: SessionDetailExtra; updatedAt: number }>()
+  private readonly sessionDetailFastCacheTtlMs = 60 * 1000
+  private readonly sessionDetailExtraCacheTtlMs = 5 * 60 * 1000
   private sessionStatusCache = new Map<string, { isFolded?: boolean; isMuted?: boolean; updatedAt: number }>()
   private readonly sessionStatusCacheTtlMs = 10 * 60 * 1000
 
@@ -1565,6 +1587,8 @@ class ChatService {
     this.sessionMessageCountCacheScope = scope
     this.sessionMessageCountCache.clear()
     this.sessionMessageCountHintCache.clear()
+    this.sessionDetailFastCache.clear()
+    this.sessionDetailExtraCache.clear()
     this.sessionStatusCache.clear()
   }
 
@@ -3819,20 +3843,9 @@ class ChatService {
   /**
    * 获取会话详情信息
    */
-  async getSessionDetail(sessionId: string): Promise<{
+  async getSessionDetailFast(sessionId: string): Promise<{
     success: boolean
-    detail?: {
-      wxid: string
-      displayName: string
-      remark?: string
-      nickName?: string
-      alias?: string
-      avatarUrl?: string
-      messageCount: number
-      firstMessageTime?: number
-      latestMessageTime?: number
-      messageTables: { dbName: string; tableName: string; count: number }[]
-    }
+    detail?: SessionDetailFast
     error?: string
   }> {
     try {
@@ -3840,53 +3853,152 @@ class ChatService {
       if (!connectResult.success) {
         return { success: false, error: connectResult.error || '数据库未连接' }
       }
+      this.refreshSessionMessageCountCacheScope()
 
-      let displayName = sessionId
+      const normalizedSessionId = String(sessionId || '').trim()
+      if (!normalizedSessionId) {
+        return { success: false, error: '会话ID不能为空' }
+      }
+
+      const now = Date.now()
+      const cachedDetail = this.sessionDetailFastCache.get(normalizedSessionId)
+      if (cachedDetail && now - cachedDetail.updatedAt <= this.sessionDetailFastCacheTtlMs) {
+        return { success: true, detail: cachedDetail.detail }
+      }
+
+      let displayName = normalizedSessionId
       let remark: string | undefined
       let nickName: string | undefined
       let alias: string | undefined
       let avatarUrl: string | undefined
-
-      const contactResult = await wcdbService.getContact(sessionId)
-      if (contactResult.success && contactResult.contact) {
-        remark = contactResult.contact.remark || undefined
-        nickName = contactResult.contact.nickName || undefined
-        alias = contactResult.contact.alias || undefined
-        displayName = remark || nickName || alias || sessionId
-      }
-      const avatarResult = await wcdbService.getAvatarUrls([sessionId])
-      if (avatarResult.success && avatarResult.map) {
-        avatarUrl = avatarResult.map[sessionId]
+      const cachedContact = this.avatarCache.get(normalizedSessionId)
+      if (cachedContact) {
+        displayName = cachedContact.displayName || normalizedSessionId
+        avatarUrl = cachedContact.avatarUrl
       }
 
-      const countResult = await wcdbService.getMessageCount(sessionId)
-      const totalMessageCount = countResult.success && countResult.count ? countResult.count : 0
+      const [contactResult, avatarResult] = await Promise.allSettled([
+        wcdbService.getContact(normalizedSessionId),
+        avatarUrl ? Promise.resolve({ success: true, map: { [normalizedSessionId]: avatarUrl } }) : wcdbService.getAvatarUrls([normalizedSessionId])
+      ])
 
-      let firstMessageTime: number | undefined
-      let latestMessageTime: number | undefined
+      if (contactResult.status === 'fulfilled' && contactResult.value.success && contactResult.value.contact) {
+        remark = contactResult.value.contact.remark || undefined
+        nickName = contactResult.value.contact.nickName || undefined
+        alias = contactResult.value.contact.alias || undefined
+        displayName = remark || nickName || alias || displayName
+      }
 
-      const earliestCursor = await wcdbService.openMessageCursor(sessionId, 1, true, 0, 0)
-      if (earliestCursor.success && earliestCursor.cursor) {
-        const batch = await wcdbService.fetchMessageBatch(earliestCursor.cursor)
-        if (batch.success && batch.rows && batch.rows.length > 0) {
-          firstMessageTime = parseInt(batch.rows[0].create_time || '0', 10) || undefined
+      if (avatarResult.status === 'fulfilled' && avatarResult.value.success && avatarResult.value.map) {
+        avatarUrl = avatarResult.value.map[normalizedSessionId]
+      }
+
+      let messageCount: number | undefined
+      const cachedCount = this.sessionMessageCountCache.get(normalizedSessionId)
+      if (cachedCount && now - cachedCount.updatedAt <= this.sessionMessageCountCacheTtlMs) {
+        messageCount = cachedCount.count
+      } else {
+        const hintCount = this.sessionMessageCountHintCache.get(normalizedSessionId)
+        if (typeof hintCount === 'number' && Number.isFinite(hintCount) && hintCount >= 0) {
+          messageCount = Math.floor(hintCount)
+          this.sessionMessageCountCache.set(normalizedSessionId, {
+            count: messageCount,
+            updatedAt: now
+          })
         }
-        await wcdbService.closeMessageCursor(earliestCursor.cursor)
       }
 
-      const latestCursor = await wcdbService.openMessageCursor(sessionId, 1, false, 0, 0)
-      if (latestCursor.success && latestCursor.cursor) {
-        const batch = await wcdbService.fetchMessageBatch(latestCursor.cursor)
-        if (batch.success && batch.rows && batch.rows.length > 0) {
-          latestMessageTime = parseInt(batch.rows[0].create_time || '0', 10) || undefined
-        }
-        await wcdbService.closeMessageCursor(latestCursor.cursor)
+      if (!Number.isFinite(messageCount)) {
+        const countResult = await wcdbService.getMessageCount(normalizedSessionId)
+        messageCount = countResult.success && Number.isFinite(countResult.count)
+          ? Math.max(0, Math.floor(countResult.count || 0))
+          : 0
+        this.sessionMessageCountCache.set(normalizedSessionId, {
+          count: messageCount,
+          updatedAt: Date.now()
+        })
       }
+
+      const detail: SessionDetailFast = {
+        wxid: normalizedSessionId,
+        displayName,
+        remark,
+        nickName,
+        alias,
+        avatarUrl,
+        messageCount: Math.max(0, Math.floor(messageCount || 0))
+      }
+
+      this.sessionDetailFastCache.set(normalizedSessionId, {
+        detail,
+        updatedAt: Date.now()
+      })
+
+      return { success: true, detail }
+    } catch (e) {
+      console.error('ChatService: 获取会话详情快速信息失败:', e)
+      return { success: false, error: String(e) }
+    }
+  }
+
+  private async getBoundaryMessageTime(sessionId: string, ascending: boolean): Promise<number | undefined> {
+    const cursorResult = await wcdbService.openMessageCursor(sessionId, 1, ascending, 0, 0)
+    if (!cursorResult.success || !cursorResult.cursor) {
+      return undefined
+    }
+
+    const cursor = cursorResult.cursor
+    try {
+      const batch = await wcdbService.fetchMessageBatch(cursor)
+      if (!batch.success || !batch.rows || batch.rows.length === 0) {
+        return undefined
+      }
+      const ts = parseInt(batch.rows[0].create_time || '0', 10)
+      return Number.isFinite(ts) && ts > 0 ? ts : undefined
+    } finally {
+      await wcdbService.closeMessageCursor(cursor)
+    }
+  }
+
+  async getSessionDetailExtra(sessionId: string): Promise<{
+    success: boolean
+    detail?: SessionDetailExtra
+    error?: string
+  }> {
+    try {
+      const connectResult = await this.ensureConnected()
+      if (!connectResult.success) {
+        return { success: false, error: connectResult.error || '数据库未连接' }
+      }
+      this.refreshSessionMessageCountCacheScope()
+
+      const normalizedSessionId = String(sessionId || '').trim()
+      if (!normalizedSessionId) {
+        return { success: false, error: '会话ID不能为空' }
+      }
+
+      const now = Date.now()
+      const cachedDetail = this.sessionDetailExtraCache.get(normalizedSessionId)
+      if (cachedDetail && now - cachedDetail.updatedAt <= this.sessionDetailExtraCacheTtlMs) {
+        return { success: true, detail: cachedDetail.detail }
+      }
+
+      const [firstMessageTimeResult, latestMessageTimeResult, tableStatsResult] = await Promise.allSettled([
+        this.getBoundaryMessageTime(normalizedSessionId, true),
+        this.getBoundaryMessageTime(normalizedSessionId, false),
+        wcdbService.getMessageTableStats(normalizedSessionId)
+      ])
+
+      const firstMessageTime = firstMessageTimeResult.status === 'fulfilled'
+        ? firstMessageTimeResult.value
+        : undefined
+      const latestMessageTime = latestMessageTimeResult.status === 'fulfilled'
+        ? latestMessageTimeResult.value
+        : undefined
 
       const messageTables: { dbName: string; tableName: string; count: number }[] = []
-      const tableStats = await wcdbService.getMessageTableStats(sessionId)
-      if (tableStats.success && tableStats.tables) {
-        for (const row of tableStats.tables) {
+      if (tableStatsResult.status === 'fulfilled' && tableStatsResult.value.success && tableStatsResult.value.tables) {
+        for (const row of tableStatsResult.value.tables) {
           messageTables.push({
             dbName: basename(row.db_path || ''),
             tableName: row.table_name || '',
@@ -3895,21 +4007,49 @@ class ChatService {
         }
       }
 
+      const detail: SessionDetailExtra = {
+        firstMessageTime,
+        latestMessageTime,
+        messageTables
+      }
+
+      this.sessionDetailExtraCache.set(normalizedSessionId, {
+        detail,
+        updatedAt: Date.now()
+      })
+
       return {
         success: true,
-        detail: {
-          wxid: sessionId,
-          displayName,
-          remark,
-          nickName,
-          alias,
-          avatarUrl,
-          messageCount: totalMessageCount,
-          firstMessageTime,
-          latestMessageTime,
-          messageTables
-        }
+        detail
       }
+    } catch (e) {
+      console.error('ChatService: 获取会话详情补充统计失败:', e)
+      return { success: false, error: String(e) }
+    }
+  }
+
+  async getSessionDetail(sessionId: string): Promise<{
+    success: boolean
+    detail?: SessionDetail
+    error?: string
+  }> {
+    try {
+      const fastResult = await this.getSessionDetailFast(sessionId)
+      if (!fastResult.success || !fastResult.detail) {
+        return { success: false, error: fastResult.error || '获取会话详情失败' }
+      }
+
+      const extraResult = await this.getSessionDetailExtra(sessionId)
+      const detail: SessionDetail = {
+        ...fastResult.detail,
+        firstMessageTime: extraResult.success ? extraResult.detail?.firstMessageTime : undefined,
+        latestMessageTime: extraResult.success ? extraResult.detail?.latestMessageTime : undefined,
+        messageTables: extraResult.success && extraResult.detail?.messageTables
+          ? extraResult.detail.messageTables
+          : []
+      }
+
+      return { success: true, detail }
     } catch (e) {
       console.error('ChatService: 获取会话详情失败:', e)
       return { success: false, error: String(e) }

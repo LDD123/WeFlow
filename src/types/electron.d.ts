@@ -144,6 +144,28 @@ export interface ElectronAPI {
       }
       error?: string
     }>
+    getSessionDetailFast: (sessionId: string) => Promise<{
+      success: boolean
+      detail?: {
+        wxid: string
+        displayName: string
+        remark?: string
+        nickName?: string
+        alias?: string
+        avatarUrl?: string
+        messageCount: number
+      }
+      error?: string
+    }>
+    getSessionDetailExtra: (sessionId: string) => Promise<{
+      success: boolean
+      detail?: {
+        firstMessageTime?: number
+        latestMessageTime?: number
+        messageTables: { dbName: string; tableName: string; count: number }[]
+      }
+      error?: string
+    }>
     getExportSessionStats: (sessionIds: string[]) => Promise<{
       success: boolean
       data?: Record<string, {

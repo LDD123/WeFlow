@@ -312,6 +312,7 @@ function ChatPage(_props: ChatPageProps) {
   const [showDetailPanel, setShowDetailPanel] = useState(false)
   const [sessionDetail, setSessionDetail] = useState<SessionDetail | null>(null)
   const [isLoadingDetail, setIsLoadingDetail] = useState(false)
+  const [isLoadingDetailExtra, setIsLoadingDetailExtra] = useState(false)
   const [copiedField, setCopiedField] = useState<string | null>(null)
   const [highlightedMessageKeys, setHighlightedMessageKeys] = useState<string[]>([])
   const [isRefreshingSessions, setIsRefreshingSessions] = useState(false)
@@ -386,6 +387,7 @@ function ChatPage(_props: ChatPageProps) {
   const searchKeywordRef = useRef('')
   const preloadImageKeysRef = useRef<Set<string>>(new Set())
   const lastPreloadSessionRef = useRef<string | null>(null)
+  const detailRequestSeqRef = useRef(0)
 
   // 加载当前用户头像
   const loadMyAvatar = useCallback(async () => {
@@ -401,25 +403,91 @@ function ChatPage(_props: ChatPageProps) {
 
   // 加载会话详情
   const loadSessionDetail = useCallback(async (sessionId: string) => {
+    const normalizedSessionId = String(sessionId || '').trim()
+    if (!normalizedSessionId) return
+
+    const requestSeq = ++detailRequestSeqRef.current
+    const mappedSession = sessionMapRef.current.get(normalizedSessionId) || sessionsRef.current.find((s) => s.username === normalizedSessionId)
+    const hintedCount = typeof mappedSession?.messageCountHint === 'number' && Number.isFinite(mappedSession.messageCountHint) && mappedSession.messageCountHint >= 0
+      ? Math.floor(mappedSession.messageCountHint)
+      : undefined
+
+    setSessionDetail((prev) => {
+      const sameSession = prev?.wxid === normalizedSessionId
+      return {
+        wxid: normalizedSessionId,
+        displayName: mappedSession?.displayName || prev?.displayName || normalizedSessionId,
+        remark: sameSession ? prev?.remark : undefined,
+        nickName: sameSession ? prev?.nickName : undefined,
+        alias: sameSession ? prev?.alias : undefined,
+        avatarUrl: mappedSession?.avatarUrl || (sameSession ? prev?.avatarUrl : undefined),
+        messageCount: hintedCount ?? (sameSession ? prev.messageCount : Number.NaN),
+        firstMessageTime: sameSession ? prev?.firstMessageTime : undefined,
+        latestMessageTime: sameSession ? prev?.latestMessageTime : undefined,
+        messageTables: sameSession && Array.isArray(prev?.messageTables) ? prev.messageTables : []
+      }
+    })
     setIsLoadingDetail(true)
+    setIsLoadingDetailExtra(true)
+
     try {
-      const result = await window.electronAPI.chat.getSessionDetail(sessionId)
+      const result = await window.electronAPI.chat.getSessionDetailFast(normalizedSessionId)
+      if (requestSeq !== detailRequestSeqRef.current) return
       if (result.success && result.detail) {
-        setSessionDetail(result.detail)
+        setSessionDetail((prev) => ({
+          wxid: normalizedSessionId,
+          displayName: result.detail!.displayName || prev?.displayName || normalizedSessionId,
+          remark: result.detail!.remark,
+          nickName: result.detail!.nickName,
+          alias: result.detail!.alias,
+          avatarUrl: result.detail!.avatarUrl || prev?.avatarUrl,
+          messageCount: Number.isFinite(result.detail!.messageCount) ? result.detail!.messageCount : prev?.messageCount ?? Number.NaN,
+          firstMessageTime: prev?.firstMessageTime,
+          latestMessageTime: prev?.latestMessageTime,
+          messageTables: Array.isArray(prev?.messageTables) ? (prev?.messageTables || []) : []
+        }))
       }
     } catch (e) {
       console.error('加载会话详情失败:', e)
     } finally {
-      setIsLoadingDetail(false)
+      if (requestSeq === detailRequestSeqRef.current) {
+        setIsLoadingDetail(false)
+      }
+    }
+
+    try {
+      const result = await window.electronAPI.chat.getSessionDetailExtra(normalizedSessionId)
+      if (requestSeq !== detailRequestSeqRef.current) return
+      if (result.success && result.detail) {
+        setSessionDetail((prev) => {
+          if (!prev || prev.wxid !== normalizedSessionId) return prev
+          return {
+            ...prev,
+            firstMessageTime: result.detail!.firstMessageTime,
+            latestMessageTime: result.detail!.latestMessageTime,
+            messageTables: Array.isArray(result.detail!.messageTables) ? result.detail!.messageTables : []
+          }
+        })
+      }
+    } catch (e) {
+      console.error('加载会话详情补充统计失败:', e)
+    } finally {
+      if (requestSeq === detailRequestSeqRef.current) {
+        setIsLoadingDetailExtra(false)
+      }
     }
   }, [])
 
   // 切换详情面板
   const toggleDetailPanel = useCallback(() => {
-    if (!showDetailPanel && currentSessionId) {
-      loadSessionDetail(currentSessionId)
+    if (showDetailPanel) {
+      setShowDetailPanel(false)
+      return
     }
-    setShowDetailPanel(!showDetailPanel)
+    setShowDetailPanel(true)
+    if (currentSessionId) {
+      void loadSessionDetail(currentSessionId)
+    }
   }, [showDetailPanel, currentSessionId, loadSessionDetail])
 
   // 复制字段值到剪贴板
@@ -1107,7 +1175,7 @@ function ChatPage(_props: ChatPageProps) {
     // 重置详情面板
     setSessionDetail(null)
     if (showDetailPanel) {
-      loadSessionDetail(session.username)
+      void loadSessionDetail(session.username)
     }
   }
 
@@ -2475,7 +2543,7 @@ function ChatPage(_props: ChatPageProps) {
                       <X size={16} />
                     </button>
                   </div>
-                  {isLoadingDetail ? (
+                  {isLoadingDetail && !sessionDetail ? (
                     <div className="detail-loading">
                       <Loader2 size={20} className="spin" />
                       <span>加载中...</span>
@@ -2530,39 +2598,35 @@ function ChatPage(_props: ChatPageProps) {
                           <span className="value highlight">
                             {Number.isFinite(sessionDetail.messageCount)
                               ? sessionDetail.messageCount.toLocaleString()
-                              : '—'}
+                              : (isLoadingDetail ? '统计中...' : '—')}
                           </span>
                         </div>
-                        {sessionDetail.firstMessageTime && (
-                          <div className="detail-item">
-                            <Calendar size={14} />
-                            <span className="label">首条消息</span>
-                            <span className="value">
-                              {Number.isFinite(sessionDetail.firstMessageTime)
-                                ? new Date(sessionDetail.firstMessageTime * 1000).toLocaleDateString('zh-CN')
-                                : '—'}
-                            </span>
-                          </div>
-                        )}
-                        {sessionDetail.latestMessageTime && (
-                          <div className="detail-item">
-                            <Calendar size={14} />
-                            <span className="label">最新消息</span>
-                            <span className="value">
-                              {Number.isFinite(sessionDetail.latestMessageTime)
-                                ? new Date(sessionDetail.latestMessageTime * 1000).toLocaleDateString('zh-CN')
-                                : '—'}
-                            </span>
-                          </div>
-                        )}
+                        <div className="detail-item">
+                          <Calendar size={14} />
+                          <span className="label">首条消息</span>
+                          <span className="value">
+                            {Number.isFinite(sessionDetail.firstMessageTime)
+                              ? new Date((sessionDetail.firstMessageTime as number) * 1000).toLocaleDateString('zh-CN')
+                              : (isLoadingDetailExtra ? '统计中...' : '—')}
+                          </span>
+                        </div>
+                        <div className="detail-item">
+                          <Calendar size={14} />
+                          <span className="label">最新消息</span>
+                          <span className="value">
+                            {Number.isFinite(sessionDetail.latestMessageTime)
+                              ? new Date((sessionDetail.latestMessageTime as number) * 1000).toLocaleDateString('zh-CN')
+                              : (isLoadingDetailExtra ? '统计中...' : '—')}
+                          </span>
+                        </div>
                       </div>
 
-                      {Array.isArray(sessionDetail.messageTables) && sessionDetail.messageTables.length > 0 && (
-                        <div className="detail-section">
-                          <div className="section-title">
-                            <Database size={14} />
-                            <span>数据库分布</span>
-                          </div>
+                      <div className="detail-section">
+                        <div className="section-title">
+                          <Database size={14} />
+                          <span>数据库分布</span>
+                        </div>
+                        {Array.isArray(sessionDetail.messageTables) && sessionDetail.messageTables.length > 0 ? (
                           <div className="table-list">
                             {sessionDetail.messageTables.map((t, i) => (
                               <div key={i} className="table-item">
@@ -2571,8 +2635,12 @@ function ChatPage(_props: ChatPageProps) {
                               </div>
                             ))}
                           </div>
-                        </div>
-                      )}
+                        ) : (
+                          <div className="detail-table-placeholder">
+                            {isLoadingDetailExtra ? '统计中...' : '暂无统计数据'}
+                          </div>
+                        )}
+                      </div>
                     </div>
                   ) : (
                     <div className="detail-empty">暂无详情</div>
