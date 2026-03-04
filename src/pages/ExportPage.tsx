@@ -471,6 +471,9 @@ const EXPORT_CARD_DIAG_POLL_INTERVAL_MS = 1200
 const EXPORT_REENTER_SESSION_SOFT_REFRESH_MS = 5 * 60 * 1000
 const EXPORT_REENTER_CONTACTS_SOFT_REFRESH_MS = 5 * 60 * 1000
 const EXPORT_REENTER_SNS_SOFT_REFRESH_MS = 3 * 60 * 1000
+const EXPORT_CONTENT_STATS_FIRST_SCREEN_LIMIT = 120
+const EXPORT_CONTENT_STATS_CHUNK_SIZE = 80
+const EXPORT_CONTENT_STATS_CHUNK_CONCURRENCY = 2
 type SessionDataSource = 'cache' | 'network' | null
 type ContactsDataSource = 'cache' | 'network' | null
 
@@ -537,6 +540,11 @@ interface SessionContentMetric {
   imageMessages?: number
   videoMessages?: number
   emojiMessages?: number
+}
+
+interface SessionContentStatsProgress {
+  completed: number
+  total: number
 }
 
 interface SessionExportCacheMeta {
@@ -869,6 +877,7 @@ function ExportPage() {
   const [isLoadingSessionCounts, setIsLoadingSessionCounts] = useState(false)
   const [sessionContentMetrics, setSessionContentMetrics] = useState<Record<string, SessionContentMetric>>({})
   const [isLoadingSessionContentStats, setIsLoadingSessionContentStats] = useState(false)
+  const [sessionContentStatsProgress, setSessionContentStatsProgress] = useState<SessionContentStatsProgress>({ completed: 0, total: 0 })
   const [contactsListScrollTop, setContactsListScrollTop] = useState(0)
   const [contactsListViewportHeight, setContactsListViewportHeight] = useState(480)
   const [contactsLoadTimeoutMs, setContactsLoadTimeoutMs] = useState(DEFAULT_CONTACTS_LOAD_TIMEOUT_MS)
@@ -960,6 +969,8 @@ function ExportPage() {
   const contactsUpdatedAtRef = useRef<number | null>(null)
   const sessionsHydratedAtRef = useRef(0)
   const snsStatsHydratedAtRef = useRef(0)
+  const filteredContactUsernamesRef = useRef<string[]>([])
+  const visibleContactUsernamesRef = useRef<string[]>([])
   const inProgressSessionIdsRef = useRef<string[]>([])
   const activeTaskCountRef = useRef(0)
   const hasBaseConfigReadyRef = useRef(false)
@@ -1526,9 +1537,16 @@ function ExportPage() {
     const exportableSessions = sourceSessions.filter(session => session.hasSession)
     if (exportableSessions.length === 0) {
       setIsLoadingSessionContentStats(false)
+      setSessionContentStatsProgress({ completed: 0, total: 0 })
       return
     }
 
+    const exportableSessionIdSet = new Set(exportableSessions.map(session => session.username))
+    const visiblePrioritySessionIds = visibleContactUsernamesRef.current
+      .filter((sessionId) => exportableSessionIdSet.has(sessionId))
+    const firstScreenPrioritySessionIds = filteredContactUsernamesRef.current
+      .filter((sessionId) => exportableSessionIdSet.has(sessionId))
+      .slice(0, EXPORT_CONTENT_STATS_FIRST_SCREEN_LIMIT)
     const prioritizedSessionIds = exportableSessions
       .filter(session => session.kind === priorityTab)
       .map(session => session.username)
@@ -1536,32 +1554,84 @@ function ExportPage() {
     const remainingSessionIds = exportableSessions
       .filter(session => !prioritizedSet.has(session.username))
       .map(session => session.username)
-    const orderedSessionIds = [...prioritizedSessionIds, ...remainingSessionIds]
+    const orderedSessionIds = Array.from(new Set([
+      ...visiblePrioritySessionIds,
+      ...firstScreenPrioritySessionIds,
+      ...prioritizedSessionIds,
+      ...remainingSessionIds
+    ]))
 
     if (orderedSessionIds.length === 0) {
       setIsLoadingSessionContentStats(false)
+      setSessionContentStatsProgress({ completed: 0, total: 0 })
       return
     }
 
-    setIsLoadingSessionContentStats(true)
-    try {
-      const chunkSize = 80
-      for (let i = 0; i < orderedSessionIds.length; i += chunkSize) {
-        const chunk = orderedSessionIds.slice(i, i + chunkSize)
-        if (chunk.length === 0) continue
-        const result = await window.electronAPI.chat.getExportSessionStats(
+    const total = orderedSessionIds.length
+    const processedSessionIds = new Set<string>()
+    const markChunkProcessed = (chunk: string[]) => {
+      for (const sessionId of chunk) {
+        processedSessionIds.add(sessionId)
+      }
+      if (!isStale()) {
+        setSessionContentStatsProgress({ completed: processedSessionIds.size, total })
+      }
+    }
+
+    const runChunk = async (chunk: string[]) => {
+      if (chunk.length === 0) return
+      const result = await withTimeout(
+        window.electronAPI.chat.getExportSessionStats(
           chunk,
           { includeRelations: false, allowStaleCache: true }
-        )
-        if (isStale()) return
-        if (result.success && result.data) {
-          mergeSessionContentMetrics(result.data as Record<string, SessionExportMetric | undefined>)
-        }
+        ),
+        25000
+      )
+      if (isStale()) return
+      if (result?.success && result.data) {
+        mergeSessionContentMetrics(result.data as Record<string, SessionExportMetric | undefined>)
       }
+      markChunkProcessed(chunk)
+    }
+
+    setIsLoadingSessionContentStats(true)
+    setSessionContentStatsProgress({ completed: 0, total })
+    try {
+      const immediateSessionIds = Array.from(new Set([
+        ...visiblePrioritySessionIds,
+        ...firstScreenPrioritySessionIds
+      ])).slice(0, EXPORT_CONTENT_STATS_FIRST_SCREEN_LIMIT)
+
+      for (let i = 0; i < immediateSessionIds.length; i += EXPORT_CONTENT_STATS_CHUNK_SIZE) {
+        const chunk = immediateSessionIds.slice(i, i + EXPORT_CONTENT_STATS_CHUNK_SIZE)
+        await runChunk(chunk)
+        if (isStale()) return
+      }
+
+      const remainingIds = orderedSessionIds.filter((sessionId) => !processedSessionIds.has(sessionId))
+      const remainingChunks: string[][] = []
+      for (let i = 0; i < remainingIds.length; i += EXPORT_CONTENT_STATS_CHUNK_SIZE) {
+        const chunk = remainingIds.slice(i, i + EXPORT_CONTENT_STATS_CHUNK_SIZE)
+        if (chunk.length === 0) continue
+        remainingChunks.push(chunk)
+      }
+
+      let nextChunkIndex = 0
+      const workerCount = Math.min(EXPORT_CONTENT_STATS_CHUNK_CONCURRENCY, remainingChunks.length)
+      await Promise.all(Array.from({ length: workerCount }, async () => {
+        while (true) {
+          if (isStale()) return
+          const index = nextChunkIndex
+          nextChunkIndex += 1
+          if (index >= remainingChunks.length) return
+          await runChunk(remainingChunks[index])
+        }
+      }))
     } catch (error) {
       console.error('导出页加载会话内容统计失败:', error)
     } finally {
       if (!isStale()) {
+        setSessionContentStatsProgress({ completed: processedSessionIds.size, total })
         setIsLoadingSessionContentStats(false)
       }
     }
@@ -1663,6 +1733,7 @@ function ExportPage() {
     setSessionContentMetrics({})
     setIsLoadingSessionCounts(false)
     setIsLoadingSessionContentStats(false)
+    setSessionContentStatsProgress({ completed: 0, total: 0 })
 
     const isStale = () => sessionLoadTokenRef.current !== loadToken
 
@@ -1943,6 +2014,7 @@ function ExportPage() {
     setIsSessionEnriching(false)
     setIsLoadingSessionCounts(false)
     setIsLoadingSessionContentStats(false)
+    setSessionContentStatsProgress({ completed: 0, total: 0 })
   }, [isExportRoute])
 
   useEffect(() => {
@@ -3425,6 +3497,14 @@ function ExportPage() {
     return filteredContacts.slice(contactStartIndex, contactEndIndex)
   }, [filteredContacts, contactStartIndex, contactEndIndex])
 
+  useEffect(() => {
+    filteredContactUsernamesRef.current = filteredContacts.map(contact => contact.username)
+  }, [filteredContacts])
+
+  useEffect(() => {
+    visibleContactUsernamesRef.current = visibleContacts.map(contact => contact.username)
+  }, [visibleContacts])
+
   const onContactsListScroll = useCallback((event: UIEvent<HTMLDivElement>) => {
     setContactsListScrollTop(event.currentTarget.scrollTop)
   }, [])
@@ -4134,7 +4214,7 @@ function ExportPage() {
           {isLoadingSessionContentStats && (
             <span className="meta-item syncing">
               <Loader2 size={12} className="spin" />
-              图片/语音/表情包/视频统计中…
+              图片/语音/表情包/视频统计中…（{sessionContentStatsProgress.completed}/{sessionContentStatsProgress.total}）
             </span>
           )}
         </div>
