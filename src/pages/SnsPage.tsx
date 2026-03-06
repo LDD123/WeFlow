@@ -1093,7 +1093,7 @@ export default function SnsPage() {
                             <div className="jump-calendar-anchor" ref={jumpCalendarWrapRef}>
                                 <button
                                     type="button"
-                                    className={`icon-btn ${showJumpPopover ? 'active' : ''}`}
+                                    className={`${jumpTargetDate ? 'jump-date-chip' : 'icon-btn'} ${showJumpPopover ? 'active' : ''}`}
                                     title={jumpTargetDate
                                         ? jumpTargetDate.toLocaleDateString('zh-CN', { year: 'numeric', month: 'long', day: 'numeric' })
                                         : '时间跳转'}
@@ -1106,7 +1106,35 @@ export default function SnsPage() {
                                         setShowJumpPopover(prev => !prev)
                                     }}
                                 >
-                                    <Calendar size={20} />
+                                    {jumpTargetDate ? (
+                                        <>
+                                            <span className="jump-date-chip-label">
+                                                {`${jumpTargetDate.getFullYear()}-${String(jumpTargetDate.getMonth() + 1).padStart(2, '0')}-${String(jumpTargetDate.getDate()).padStart(2, '0')}`}
+                                            </span>
+                                            <span
+                                                className="jump-date-chip-clear"
+                                                role="button"
+                                                tabIndex={0}
+                                                onClick={(event) => {
+                                                    event.stopPropagation()
+                                                    setJumpTargetDate(undefined)
+                                                    setShowJumpPopover(false)
+                                                }}
+                                                onKeyDown={(event) => {
+                                                    if (event.key !== 'Enter' && event.key !== ' ') return
+                                                    event.preventDefault()
+                                                    event.stopPropagation()
+                                                    setJumpTargetDate(undefined)
+                                                    setShowJumpPopover(false)
+                                                }}
+                                                aria-label="清除日期跳转"
+                                            >
+                                                <X size={14} />
+                                            </span>
+                                        </>
+                                    ) : (
+                                        <Calendar size={20} />
+                                    )}
                                 </button>
                                 <JumpToDatePopover
                                     isOpen={showJumpPopover}
