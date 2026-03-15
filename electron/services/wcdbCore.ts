@@ -1488,10 +1488,19 @@ export class WcdbCore {
       }
 
       // 让出控制权，避免阻塞事件循环
+      const handle = this.handle
       await new Promise(resolve => setImmediate(resolve))
 
+      // await 后 handle 可能已被关闭，需重新检查
+      if (handle === null || this.handle !== handle) {
+        if (Object.keys(resultMap).length > 0) {
+          return { success: true, map: resultMap, error: '连接已断开' }
+        }
+        return { success: false, error: '连接已断开' }
+      }
+
       const outPtr = [null as any]
-      const result = this.wcdbGetAvatarUrls(this.handle, JSON.stringify(toFetch), outPtr)
+      const result = this.wcdbGetAvatarUrls(handle, JSON.stringify(toFetch), outPtr)
 
       // DLL 调用后再次让出控制权
       await new Promise(resolve => setImmediate(resolve))
