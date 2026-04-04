@@ -891,6 +891,8 @@ export interface ExportOptions {
   exportVoices?: boolean
   exportVideos?: boolean
   exportEmojis?: boolean
+  exportFiles?: boolean
+  maxFileSizeMb?: number
   exportVoiceAsText?: boolean
   excelCompactColumns?: boolean
   txtColumns?: string[]
