@@ -21,6 +21,8 @@ interface MessagePushPayload {
   sourceName: string
   groupName?: string
   content: string | null
+  eventId: string
+  timestamp: number
 }
 
 const PUSH_CONFIG_KEYS = new Set([
@@ -313,6 +315,8 @@ class MessagePushService {
     const sessionType = this.getSessionType(sessionId, session)
     const content = this.getMessageDisplayContent(message)
 
+    const createTime = Number(message.createTime || 0)
+
     if (isGroup) {
       const groupInfo = await chatService.getContactAvatar(sessionId)
       const groupName = session.displayName || groupInfo?.displayName || sessionId
@@ -326,7 +330,9 @@ class MessagePushService {
         avatarUrl,
         groupName,
         sourceName,
-        content
+        content,
+        eventId: messageKey,
+        timestamp: createTime
       }
     }
 
@@ -339,7 +345,9 @@ class MessagePushService {
       messageKey,
       avatarUrl,
       sourceName: session.displayName || contactInfo?.displayName || sessionId,
-      content
+      content,
+      eventId: messageKey,
+      timestamp: createTime
     }
   }
 
